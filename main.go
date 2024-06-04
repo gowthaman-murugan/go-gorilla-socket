@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/json"
 	"log"
-	"strings"
+	"net/http"
+	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -12,11 +14,19 @@ import (
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
 }
 
 type DataProps struct {
 	CaseID    string `json:"case_id"`
 	PatientId string `json:"patient_id omitempty"`
+}
+
+type User struct {
+	ID   string
+	Conn *websocket.Conn
 }
 
 type UserMessage struct {
@@ -29,10 +39,39 @@ var actions = map[string]string{
 	"OPEN_PATIENT": "PATIENT_OPENED",
 }
 
+var (
+	users = make(map[string]*User)
+	mu    sync.Mutex
+)
+
+func Logger() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		t := time.Now()
+
+		// Set example variable
+		c.Set("example", "12345")
+		// token := c.Request.Header["Token"]
+		// log.Println("....token...", token[0])
+
+		// before request
+
+		c.Next()
+
+		// after request
+		latency := time.Since(t)
+		log.Print(latency)
+
+		// access the status we are sending
+		status := c.Writer.Status()
+		log.Println(status)
+	}
+}
+
 func main() {
 
 	// Create a new Gin router
 	r := gin.Default()
+	r.Use(Logger())
 
 	r.GET("/ws", wsHandler)
 
@@ -58,7 +97,7 @@ func sendMessage(conn *websocket.Conn, action string) error {
 			return err
 		}
 
-		defer conn.Close()
+		// defer conn.Close()
 	}
 	err := conn.WriteMessage(websocket.TextMessage, []byte(actions[action]))
 	if err != nil {
@@ -69,51 +108,121 @@ func sendMessage(conn *websocket.Conn, action string) error {
 }
 
 func wsHandler(c *gin.Context) {
-
-	// Upgrade the HTTP connection to a WebSocket connection
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
-		log.Println("Failed to set websocket upgrade:", err)
+		log.Fatal(err)
 		return
 	}
 	defer conn.Close()
 
-	// Handle WebSocket messages
+	// In a real application, you would authenticate the user and get their userID
+	userID := c.Query("user_id")
+	if userID == "" {
+		log.Println("User ID is missing")
+		return
+	}
+
+	mu.Lock()
+	users[userID] = &User{ID: userID, Conn: conn}
+	mu.Unlock()
+
+	log.Printf("User %s connected", userID)
+
 	for {
-		// starte read message
-		// here messageType is an int with value websocket.BinaryMessage or websocket.TextMessage
-		// message user message
-		messageType, message, err := conn.ReadMessage()
+		var msg map[string]string
+		err := conn.ReadJSON(&msg)
 		if err != nil {
-			log.Println("Read error:", err)
-			return
-		}
-		if messageType == websocket.BinaryMessage {
-			log.Println("we unable to read binary message")
-			return
+			log.Printf("Error: %v", err)
+			break
 		}
 
-		if messageType == websocket.TextMessage {
-			userMessage := UserMessage{}
-			log.Printf("isJSON...%v\n", isJSON(string(message)))
-			if isJSON(string(message)) {
-				err := json.Unmarshal(message, &userMessage)
-				if err != nil {
-					log.Println("Unmarshal error:", err)
-					return
-				}
-				action := strings.ToUpper(strings.Trim(userMessage.Action, "\n"))
-				err = sendMessage(conn, action)
-				log.Println("error:", err)
+		targetID := msg["targetID"]
+		message := msg["message"]
 
-				return
-			} else {
-				action := strings.ToUpper(strings.Trim(string(message), "\n"))
-				err := sendMessage(conn, action)
-				log.Println("error:", err)
+		mu.Lock()
+		targetUser, ok := users[targetID]
+		mu.Unlock()
 
+		if ok {
+			err := targetUser.Conn.WriteJSON(map[string]string{"message": message})
+			if err != nil {
+				log.Printf("Error: %v", err)
 			}
-
+		} else {
+			log.Printf("User %s not connected", targetID)
 		}
 	}
+
+	mu.Lock()
+	delete(users, userID)
+	mu.Unlock()
+	log.Printf("User %s disconnected", userID)
 }
+
+// func wsHandler(c *gin.Context) {
+// 	userId := c.Query("user_id")
+
+// 	if userId == "" {
+// 		log.Println("User ID is missing")
+// 		return
+// 	}
+
+// 	// Upgrade the HTTP connection to a WebSocket connection
+// 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+// 	if err != nil {
+// 		log.Println("Failed to set websocket upgrade:", err)
+// 		return
+// 	}
+// 	defer conn.Close()
+
+// 	mu.Lock()
+// 	users[userId] = &Client{ID: userId, Conn: conn}
+// 	mu.Unlock()
+
+// 	log.Printf("User %s connected", userId)
+
+// 	// Handle WebSocket messages
+// 	for {
+// 		var msg map[string]string
+// 		err := conn.ReadJSON(&msg)
+// 		if err != nil {
+// 			log.Printf("Error: %v", err)
+// 			break
+// 		}
+// 		// starte read message
+// 		// here messageType is an int with value websocket.BinaryMessage or websocket.TextMessage
+// 		// message user message
+// 		messageType, message, err := conn.ReadMessage()
+// 		if err != nil {
+// 			log.Println("Read error:", err)
+// 			return
+// 		}
+// 		if messageType == websocket.BinaryMessage {
+// 			log.Println("we unable to read binary message")
+// 			return
+// 		}
+
+// 		if messageType == websocket.TextMessage {
+// 			userMessage := UserMessage{}
+// 			log.Printf("isJSON...%v\n", isJSON(string(message)))
+// 			if isJSON(string(message)) {
+// 				err := json.Unmarshal(message, &userMessage)
+// 				if err != nil {
+// 					log.Println("Unmarshal error:", err)
+// 					return
+// 				}
+// 				action := strings.ToUpper(strings.Trim(userMessage.Action, "\n"))
+// 				err = sendMessage(conn, action)
+// 				log.Println("error:", err)
+
+// 				return
+// 			} else {
+// 				action := strings.ToUpper(strings.Trim(string(message), "\n"))
+// 				err := sendMessage(conn, action)
+// 				log.Println("error:", err)
+
+// 			}
+
+// 		}
+// 	}
+// }
